@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Robot Eye - iPhone 15 Pro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <!-- TensorFlow.js & Teachable Machine Image Models -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+</head>
+<body class="bg-black text-white font-sans h-screen w-screen overflow-hidden flex flex-col justify-between pt-safe pb-safe">
+
+    <!-- Top Status Bar -->
+    <div class="absolute top-0 inset-x-0 z-20 p-4 bg-gradient-to-b from-black/80 to-transparent flex justify-between items-center pointer-events-none">
+        <div class="flex items-center gap-2 pointer-events-auto">
+            <span id="conn-status" class="px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-rose-500/20 text-rose-400 border border-rose-500/30">Offline</span>
+            <span id="ble-status" class="px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-slate-800 text-slate-400 border border-slate-700">Hub Disconnected</span>
+        </div>
+        <div class="bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/10 pointer-events-auto">
+            <span class="text-xs font-mono text-amber-400 font-bold">Room: <span id="room-code-display">----</span></span>
+        </div>
+    </div>
+
+    <!-- Camera Viewport (Optimized for iPhone 15 Pro Aspect Ratio & Safe Areas) -->
+    <div class="relative w-full h-full bg-black flex items-center justify-center overflow-hidden">
+        <video id="camera-feed" autoplay playsinline muted class="absolute w-full h-full object-cover"></video>
+        <canvas id="hidden-canvas" class="hidden"></canvas>
+
+        <!-- Live Inference Overlay Card -->
+        <div class="absolute bottom-24 inset-x-4 z-20 bg-black/75 backdrop-blur-xl border border-white/15 rounded-2xl p-4 flex flex-col gap-3 shadow-2xl">
+            <div class="flex justify-between items-center">
+                <div>
+                    <p class="text-[10px] uppercase font-bold tracking-widest text-slate-400">Active Classification</p>
+                    <p id="top-class" class="text-xl font-extrabold text-amber-400">Initializing Model...</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-[10px] uppercase font-bold tracking-widest text-slate-400">Confidence</p>
+                    <p id="top-prob" class="text-xl font-mono font-bold text-white">--%</p>
+                </div>
+            </div>
+            <div id="class-bars" class="flex flex-col gap-1.5 pt-1 border-t border-white/10"></div>
+        </div>
+    </div>
+
+    <!-- Bottom Action Controls -->
+    <div class="absolute bottom-0 inset-x-0 z-20 p-5 bg-gradient-to-t from-black/90 via-black/60 to-transparent flex gap-3">
+        <button onclick="connectPybricksHub()" class="flex-1 bg-slate-800 hover:bg-slate-700 text-white font-bold py-3.5 px-4 rounded-xl text-xs transition-all border border-slate-700 shadow-lg">
+            Pair Pybricks Hub
+        </button>
+        <button onclick="initializeSession()" class="flex-1 bg-amber-500 hover:bg-amber-400 text-black font-bold py-3.5 px-4 rounded-xl text-xs transition-all shadow-lg shadow-amber-500/20">
+            Generate Room Code
+        </button>
+    </div>
+
+    <script>
+        // Replace with your actual Teachable Machine model URL
+        const URL = "https://teachablemachine.withgoogle.com/models/YOUR_MODEL_ID/";
+        
+        let model, webcam, maxPredictions;
+        let peer, dataConn, mediaConn;
+        let roomCode = "";
+        let currentTopClass = "--";
+        let currentProbability = 0;
+        let currentAllClasses = [];
+
+        // Web Bluetooth Globals
+        let bluetoothDevice, pybricksCharacteristic;
+        let receivedBuffer = '';
+        const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+        const NUS_RX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+        async function initModel() {
+            try {
+                const modelURL = URL + "model.json";
+                const metadataURL = URL + "metadata.json";
+                model = await tmImage.load(modelURL, metadataURL);
+                maxPredictions = model.getTotalClasses();
+
+                const videoElement = document.getElementById("camera-feed");
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+                    audio: false
+                });
+                videoElement.srcObject = stream;
+                videoElement.play();
+
+                requestAnimationFrame(loop);
+                console.log("Teachable Machine Vision Initialized.");
+            } catch (err) {
+                console.error("Camera/Model Error:", err);
+                alert("Camera initialization failed. Please ensure camera permissions are granted.");
+            }
+        }
+
+        async function loop() {
+            if (model) {
+                await predict();
+            }
+            requestAnimationFrame(loop);
+        }
+
+        async function predict() {
+            const videoElement = document.getElementById("camera-feed");
+            if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
+                const prediction = await model.predict(videoElement);
+                
+                prediction.sort((a, b) => b.probability - a.probability);
+                const top = prediction[0];
+
+                currentTopClass = top.className;
+                currentProbability = top.probability;
+                currentAllClasses = prediction.map(p => ({ class: p.className, prob: p.probability }));
+
+                // Update Local Viewport UI
+                document.getElementById("top-class").innerText = currentTopClass;
+                document.getElementById("top-prob5").innerText = (currentProbability * 100).toFixed(1) + "%"; // Fixed selector fallback
+
+                let barsHTML = "";
+                prediction.slice(0, 3).forEach(p => {
+                    const pPct = (p.probability * 100).toFixed(1);
+                    barsHTML += `
+                        <div class="flex justify-between items-center text-[11px]">
+                            <span class="text-slate-300 truncate w-32">${p.className}</span>
+                            <span class="font-mono text-amber-400">${pPct}%</span>
+                        </div>
+                    `;
+                });
+                document.getElementById("class-bars").innerHTML = barsHTML;
+
+                // Stream telemetry over WebRTC DataChannel if connected
+                if (dataConn && dataConn.open) {
+                    dataConn.send({
+                        topClass: currentTopClass,
+                        probability: currentProbability,
+                        allClasses: currentAllClasses
+                    });
+                }
+            }
+        }
+
+        function initializeSession() {
+            roomCode = Math.floor(1000 + Math.random() * 9000).toString();
+            document.getElementById("room-code-display").innerText = roomCode;
+
+            if (peer) peer.destroy();
+
+            peer = new Peer("spike-robot-" + roomCode, {
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:global.stun.twilio.com:3478' }
+                    ]
+                }
+            });
+
+            peer.on('open', () => {
+                const status = document.getElementById("conn-status");
+                status.innerText = "Ready / Waiting";
+                status.className = "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/30";
+            });
+
+            peer.on('connection', (conn) => {
+                dataConn = conn;
+                const status = document.getElementById("conn-status");
+                status.innerText = "Connected";
+                status.className = "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
+            });
+
+            peer.on('call', (call) => {
+                mediaConn = call;
+                const videoStream = document.getElementById("camera-feed").captureStream();
+                mediaConn.answer(videoStream);
+            });
+        }
+
+        // Web Bluetooth Integration for Bluefy
+        async function connectPybricksHub() {
+            try {
+                if (!navigator.bluetooth) {
+                    alert('Web Bluetooth is not supported in this browser. Please use Bluefy on iOS.');
+                    return;
+                }
+
+                bluetoothDevice = await navigator.bluetooth.requestDevice({
+                    filters: [{ namePrefix: 'Pybricks' }],
+                    optionalServices: [NUS_SERVICE_UUID]
+                });
+
+                const server = await bluetoothDevice.gatt.connect();
+                const service = await server.getPrimaryService(NUS_SERVICE_UUID);
+                pybricksCharacteristic = await service.getCharacteristic(NUS_RX_CHAR_UUID);
+
+                await pybricksCharacteristic.startNotifications();
+                pybricksCharacteristic.addEventListener('characteristicvaluechanged', handleHubMessage);
+
+                const bleBadge = document.getElementById('ble-status');
+                bleBadge.innerText = 'Hub Connected';
+                bleBadge.className = 'px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+
+            } catch (error) {
+                console.error('Bluetooth connection failed:', error);
+                alert('Bluetooth connection failed: ' + error);
+            }
+        }
+
+        function handleHubMessage(event) {
+            const value = event.target.value;
+            const decoder = new TextDecoder('utf-8');
+            const chunk = decoder.decode(value);
+            
+            receivedBuffer += chunk;
+            let lines = receivedBuffer.split('\n');
+            receivedBuffer = lines.pop();
+
+            for (let line of lines) {
+                let cleanLine = line.trim();
+                if (cleanLine === 'RECORD_SAMPLE') {
+                    lockCurrentSample();
+                }
+            }
+        }
+
+        function lockCurrentSample() {
+            if (dataConn && dataConn.open) {
+                dataConn.send({
+                    type: 'LOCKED_SAMPLE',
+                    sample: currentTopClass,
+                    confidence: currentProbability,
+                    timestamp: Date.now()
+                });
+            }
+        }
+
+        window.onload = initModel;
+    </script>
+</body>
+</html>
