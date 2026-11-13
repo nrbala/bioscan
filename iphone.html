@@ -115,7 +115,7 @@
 
                 // Update Local Viewport UI
                 document.getElementById("top-class").innerText = currentTopClass;
-                document.getElementById("top-prob5").innerText = (currentProbability * 100).toFixed(1) + "%"; // Fixed selector fallback
+                document.getElementById("top-prob").innerText = (currentProbability * 100).toFixed(1) + "%";
 
                 let barsHTML = "";
                 prediction.slice(0, 3).forEach(p => {
