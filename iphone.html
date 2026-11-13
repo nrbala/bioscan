@@ -60,6 +60,7 @@
         
         let model, webcam, maxPredictions;
         let peer, dataConn, mediaConn;
+        let localStream = null; // Added to store camera stream globally
         let roomCode = "";
         let currentTopClass = "--";
         let currentProbability = 0;
@@ -79,11 +80,11 @@
                 maxPredictions = model.getTotalClasses();
 
                 const videoElement = document.getElementById("camera-feed");
-                const stream = await navigator.mediaDevices.getUserMedia({
+                localStream = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
                     audio: false
                 });
-                videoElement.srcObject = stream;
+                videoElement.srcObject = localStream;
                 videoElement.play();
 
                 requestAnimationFrame(loop);
@@ -166,12 +167,11 @@
                 const status = document.getElementById("conn-status");
                 status.innerText = "Connected";
                 status.className = "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
-            });
 
-            peer.on('call', (call) => {
-                mediaConn = call;
-                const videoStream = document.getElementById("camera-feed").captureStream();
-                mediaConn.answer(videoStream);
+                // Automatically push video stream to laptop upon connection
+                if (localStream) {
+                    mediaConn = peer.call(conn.peer, localStream);
+                }
             });
         }
 
