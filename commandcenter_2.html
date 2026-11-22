@@ -6,7 +6,6 @@
     <title>Robot Eye Dashboard (Laptop)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
-    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
     <div class="max-w-6xl mx-auto flex flex-col gap-6">
@@ -23,7 +22,7 @@
             <div class="flex items-center gap-2">
                 <input id="target-room-id" type="text" maxlength="4" placeholder="4-digit code"
                     class="bg-slate-950 text-amber-400 font-mono text-center font-bold tracking-widest text-base px-4 py-2 rounded-xl border border-slate-700 w-52 focus:outline-none focus:border-amber-500">
-                <button onclick="connectToiPhone()" class="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-5 py-2 rounded-xl text-sm transition-all shadow-lg shadow-amber-500/20">
+                <button id="connect-btn" type="button" onclick="connectToiPhone()" class="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-5 py-2 rounded-xl text-sm transition-all shadow-lg shadow-amber-500/20">
                     Connect
                 </button>
             </div>
@@ -82,7 +81,7 @@
                             <h2 class="text-md font-bold text-amber-400">Captured Samples Report</h2>
                             <p id="capture-state-label" class="text-xs text-slate-400">Scanning checkpoints...</p>
                         </div>
-                        <button onclick="resetReportForNextRun()" class="bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 font-bold px-3.5 py-1.5 rounded-lg text-xs transition-all border border-rose-500/40">
+                        <button type="button" onclick="resetReportForNextRun()" class="bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 font-bold px-3.5 py-1.5 rounded-lg text-xs transition-all border border-rose-500/40">
                             Reset Run
                         </button>
                     </div>
@@ -99,12 +98,10 @@
         const ICE_SERVERS = [
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:global.stun.twilio.com:3478' }
-            // Optional TURN fallback for strict mobile hotspot NAT:
-            // { urls: 'turn:your-turn-server.example.com:3478', username: 'user', credential: 'password' }
         ];
         const FALLBACK_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
 
-        let peer, dataConn, mediaCall, fallbackClient, fallbackTimer;
+        let peer, dataConn, mediaCall, fallbackClient, fallbackTimer, mqttScriptLoading;
         let lastMsgTimestamp = Date.now();
         let lastIngestedAt = 0;
         let hasVideoStream = false;
@@ -119,8 +116,30 @@
 
         // Configuration for Auto-Capture
         const CONFIDENCE_THRESHOLD = 0.80;
-        const HOLD_DURATION_MS = 1000;     // 1 second steady hold per checkpoint
+        const HOLD_DURATION_MS = 1000;
         const IGNORED_CLASSES = ["background", "nothing", "none", "no sample", "empty"];
+
+        function ensureMqttLoaded(callback) {
+            if (typeof mqtt !== 'undefined') {
+                callback();
+                return;
+            }
+            if (mqttScriptLoading) return;
+            mqttScriptLoading = true;
+
+            const s = document.createElement('script');
+            s.src = 'https://unpkg.com/mqtt/dist/mqtt.min.js';
+            s.async = true;
+            s.onload = () => {
+                mqttScriptLoading = false;
+                callback();
+            };
+            s.onerror = () => {
+                mqttScriptLoading = false;
+                console.warn("Could not load MQTT fallback script.");
+            };
+            document.head.appendChild(s);
+        }
 
         function cleanupConnections() {
             if (fallbackTimer) {
@@ -141,104 +160,27 @@
 
         function startFallbackTelemetry(roomCode) {
             if (fallbackClient || (dataConn && dataConn.open)) return;
-            if (typeof mqtt === 'undefined') {
-                console.warn("MQTT client library not loaded for fallback telemetry.");
-                return;
-            }
 
-            const topic = `bioscan/telemetry/${roomCode}`;
-            console.warn("DataChannel not open; starting fallback telemetry on:", topic);
+            ensureMqttLoaded(() => {
+                if (fallbackClient || (dataConn && dataConn.open) || typeof mqtt === 'undefined') return;
+                const topic = `bioscan/telemetry/${roomCode}`;
+                console.warn("DataChannel not open; starting fallback telemetry on:", topic);
 
-            fallbackClient = mqtt.connect(FALLBACK_BROKER_URL, {
-                clientId: `bioscan-laptop-${roomCode}-${Math.random().toString(16).slice(2, 6)}`,
-                clean: true,
-                reconnectPeriod: 2000
-            });
-
-            fallbackClient.on('connect', () => {
-                fallbackClient.subscribe(topic, { qos: 0 }, (err) => {
-                    if (err) console.error("Fallback subscribe error:", err);
-                });
-            });
-
-            fallbackClient.on('message', (_t, payload) => {
-                try {
-                    const parsed = JSON.parse(payload.toString());
-                    ingestIncomingPayload(parsed, "Relay");
-                } catch (e) {
-                    console.error("Invalid fallback telemetry payload:", e);
-                }
-            });
-
-            fallbackClient.on('error', (err) => {
-                console.error("Fallback telemetry error:", err);
-            });
-        }
-
-        function ingestIncomingPayload(data, transportLabel) {
-            if (!data) return;
-            const now = Date.now();
-            if (now - lastIngestedAt < 35) return; // Deduplicate near-simultaneous packets
-            lastIngestedAt = now;
-
-            hasTelemetryData = true;
-            updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
-
-            if (data.topClass) {
-                handleTelemetryData(data, transportLabel);
-            }
-        }
-
-        function connectToiPhone() {
-            const codeInput = document.getElementById("target-room-id").value.trim();
-            if (!codeInput || codeInput.length !== 4 || isNaN(codeInput)) {
-                alert("Please enter the 4-digit Room ID displayed on your iPhone screen.");
-                return;
-            }
-
-            const targetPeerId = "spike-robot-" + codeInput;
-            hasVideoStream = false;
-            hasTelemetryData = false;
-            updateStatus("Connecting...", "bg-amber-500", "text-amber-400");
-
-            cleanupConnections();
-
-            peer = new Peer({
-                config: { iceServers: ICE_SERVERS }
-            });
-
-            peer.on('open', (id) => {
-                console.log("Command Center Peer open:", id);
-                dataConn = peer.connect(targetPeerId, { reliable: true });
-
-                dataConn.on('open', () => {
-                    console.log("Command Center DataChannel opened to:", targetPeerId);
-                    if (fallbackTimer) {
-                        clearTimeout(fallbackTimer);
-                        fallbackTimer = null;
-                    }
-                    if (fallbackClient) {
-                        try { fallbackClient.end(true); } catch (e) {}
-                        fallbackClient = null;
-                    }
-                    updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
+                fallbackClient = mqtt.connect(FALLBACK_BROKER_URL, {
+                    clientId: `bioscan-laptop-${roomCode}-${Math.random().toString(16).slice(2, 6)}`,
+                    clean: true,
+                    reconnectPeriod: 2000
                 });
 
-                dataConn.on('data', (data) => {
-                    ingestIncomingPayload(data, "WebRTC");
+                fallbackClient.on('connect', () => {
+                    fallbackClient.subscribe(topic, { qos: 0 }, (err) => {
+                        if (err) console.error("Fallback subscribe error:", err);
+                    });
                 });
 
-                dataConn.on('error', (err) => {
-                    console.error("DataChannel Error:", err);
-                    startFallbackTelemetry(codeInput);
-                });
-
-                dataConn.on('close', () => {
-                    console.warn("DataChannel closed.");
-                    if (!hasVideoStream) {
-                        updateStatus("Disconnected", "bg-rose-500", "text-rose-400");
-                    }
-                });
-
-                fallbackTimer = setTimeout(() => {
-                    if
+                fallbackClient.on('message', (_t, payload) => {
+                    try {
+                        const parsed = JSON.parse(payload.toString());
+                        ingestIncomingPayload(parsed, "Relay");
+                    } catch (e) {
+                        console.error("Invalid fallback
