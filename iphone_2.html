@@ -6,6 +6,7 @@
     <title>Robot Eye - iPhone 15 Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <!-- TensorFlow.js & Teachable Machine Image Models -->
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
@@ -62,11 +63,13 @@
             // Optional TURN fallback for strict mobile hotspot NAT:
             // { urls: 'turn:your-turn-server.example.com:3478', username: 'user', credential: 'password' }
         ];
+        const FALLBACK_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
 
         let model, maxPredictions;
-        let peer, dataConn, mediaConn;
+        let peer, dataConn, mediaConn, fallbackClient, fallbackTimer;
         let localStream = null;
         let roomCode = "";
+        let lastFallbackPublishAt = 0;
         let currentTopClass = "--";
         let currentProbability = 0;
         let currentAllClasses = [];
@@ -76,6 +79,54 @@
         let receivedBuffer = '';
         const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
         const NUS_RX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+        function cleanupSession() {
+            if (fallbackTimer) {
+                clearTimeout(fallbackTimer);
+                fallbackTimer = null;
+            }
+            if (fallbackClient) {
+                try { fallbackClient.end(true); } catch (e) {}
+                fallbackClient = null;
+            }
+            if (peer) {
+                try { peer.destroy(); } catch (e) {}
+                peer = null;
+            }
+            dataConn = null;
+            mediaConn = null;
+        }
+
+        function startFallbackPublisher(code) {
+            if (fallbackClient || !code || (dataConn && dataConn.open)) return;
+            if (typeof mqtt === 'undefined') return;
+
+            fallbackClient = mqtt.connect(FALLBACK_BROKER_URL, {
+                clientId: `bioscan-iphone-${code}-${Math.random().toString(16).slice(2, 6)}`,
+                clean: true,
+                reconnectPeriod: 2000
+            });
+
+            fallbackClient.on('connect', () => {
+                console.log("iPhone fallback telemetry connected for room:", code);
+            });
+
+            fallbackClient.on('error', (err) => {
+                console.error("iPhone fallback telemetry error:", err);
+            });
+        }
+
+        function sendTelemetryPayload(payload) {
+            if (dataConn && dataConn.open) {
+                dataConn.send(payload);
+                return;
+            }
+            const now = Date.now();
+            if (fallbackClient && fallbackClient.connected && roomCode && (now - lastFallbackPublishAt >= 120)) {
+                lastFallbackPublishAt = now;
+                fallbackClient.publish(`bioscan/telemetry/${roomCode}`, JSON.stringify(payload), { qos: 0 });
+            }
+        }
 
         async function initModel() {
             try {
@@ -134,13 +185,11 @@
                 });
                 document.getElementById("class-bars").innerHTML = barsHTML;
 
-                if (dataConn && dataConn.open) {
-                    dataConn.send({
-                        topClass: currentTopClass,
-                        probability: currentProbability,
-                        allClasses: currentAllClasses
-                    });
-                }
+                sendTelemetryPayload({
+                    topClass: currentTopClass,
+                    probability: currentProbability,
+                    allClasses: currentAllClasses
+                });
             }
         }
 
@@ -148,7 +197,7 @@
             roomCode = Math.floor(1000 + Math.random() * 9000).toString();
             document.getElementById("room-code-display").innerText = roomCode;
 
-            if (peer) peer.destroy();
+            cleanupSession();
 
             peer = new Peer("spike-robot-" + roomCode, {
                 config: { iceServers: ICE_SERVERS }
@@ -158,10 +207,17 @@
                 const status = document.getElementById("conn-status");
                 status.innerText = "Ready / Waiting";
                 status.className = "px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/30";
+
+                fallbackTimer = setTimeout(() => {
+                    if (!dataConn || !dataConn.open) {
+                        startFallbackPublisher(roomCode);
+                    }
+                }, 2500);
             });
 
             peer.on('error', (err) => {
                 console.error("iPhone Peer Error:", err);
+                startFallbackPublisher(roomCode);
             });
 
             peer.on('connection', (conn) => {
@@ -172,14 +228,24 @@
 
                 conn.on('open', () => {
                     console.log("iPhone DataChannel OPEN");
+                    if (fallbackTimer) {
+                        clearTimeout(fallbackTimer);
+                        fallbackTimer = null;
+                    }
+                    if (fallbackClient) {
+                        try { fallbackClient.end(true); } catch (e) {}
+                        fallbackClient = null;
+                    }
                 });
 
                 conn.on('error', (err) => {
                     console.error("iPhone DataChannel Error:", err);
+                    startFallbackPublisher(roomCode);
                 });
 
                 conn.on('close', () => {
                     console.warn("iPhone DataChannel CLOSED");
+                    startFallbackPublisher(roomCode);
                 });
 
                 if (localStream) {
@@ -235,14 +301,12 @@
         }
 
         function lockCurrentSample() {
-            if (dataConn && dataConn.open) {
-                dataConn.send({
-                    type: 'LOCKED_SAMPLE',
-                    sample: currentTopClass,
-                    confidence: currentProbability,
-                    timestamp: Date.now()
-                });
-            }
+            sendTelemetryPayload({
+                type: 'LOCKED_SAMPLE',
+                sample: currentTopClass,
+                confidence: currentProbability,
+                timestamp: Date.now()
+            });
         }
 
         window.onload = initModel;
