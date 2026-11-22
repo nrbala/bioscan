@@ -166,31 +166,49 @@
                 });
             });
 
-            peer.on('call', (call) => {
-                mediaCall = call;
-                call.answer();
+            peer.on('open', (id) => {
+                console.log("Command Center Peer open:", id);
 
-                call.on('stream', (remoteStream) => {
-                    hasVideoStream = true;
-                    const videoElem = document.getElementById("remote-video");
-                    videoElem.srcObject = remoteStream;
-                    videoElem.play().catch(e => console.log("Autoplay constraint handled:", e));
-
-                    document.getElementById("video-placeholder").classList.add("hidden");
-                    document.getElementById("detection-overlay").classList.remove("hidden");
-                    updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
-                });
-
-                call.on('close', () => {
-                    hasVideoStream = false;
-                    if (!hasTelemetryData && (!dataConn || !dataConn.open)) {
-                        updateStatus("Disconnected", "bg-rose-500", "text-rose-400");
+                const openDataChannel = () => {
+                    if (dataConn && dataConn.open) return;
+                    if (dataConn) {
+                        try { dataConn.close(); } catch (e) {}
                     }
-                });
+                    dataConn = peer.connect(targetPeerId, { reliable: true });
 
-                call.on('error', (err) => {
-                    console.error("Media Call Error:", err);
-                });
+                    dataConn.on('open', () => {
+                        console.log("Command Center DataChannel opened to:", targetPeerId);
+                        updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
+                    });
+
+                    dataConn.on('data', (data) => {
+                        hasTelemetryData = true;
+                        updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
+                        if (data && data.topClass) {
+                            handleTelemetryData(data);
+                        }
+                    });
+
+                    dataConn.on('error', (err) => {
+                        console.error("DataChannel Error:", err);
+                    });
+
+                    dataConn.on('close', () => {
+                        console.warn("DataChannel closed.");
+                        if (!hasVideoStream) {
+                            updateStatus("Disconnected", "bg-rose-500", "text-rose-400");
+                        }
+                    });
+                };
+
+                openDataChannel();
+
+                setTimeout(() => {
+                    if (!hasTelemetryData && (!dataConn || !dataConn.open) && peer && !peer.destroyed) {
+                        console.warn("DataChannel still not open on hotspot; retrying...");
+                        openDataChannel();
+                    }
+                }, 2500);
             });
 
             peer.on('error', (err) => {
