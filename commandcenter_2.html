@@ -6,6 +6,7 @@
     <title>Robot Eye Dashboard (Laptop)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
     <div class="max-w-6xl mx-auto flex flex-col gap-6">
@@ -101,9 +102,11 @@
             // Optional TURN fallback for strict mobile hotspot NAT:
             // { urls: 'turn:your-turn-server.example.com:3478', username: 'user', credential: 'password' }
         ];
+        const FALLBACK_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
 
-        let peer, dataConn, mediaCall;
+        let peer, dataConn, mediaCall, fallbackClient, fallbackTimer;
         let lastMsgTimestamp = Date.now();
+        let lastIngestedAt = 0;
         let hasVideoStream = false;
         let hasTelemetryData = false;
 
@@ -119,6 +122,73 @@
         const HOLD_DURATION_MS = 1000;     // 1 second steady hold per checkpoint
         const IGNORED_CLASSES = ["background", "nothing", "none", "no sample", "empty"];
 
+        function cleanupConnections() {
+            if (fallbackTimer) {
+                clearTimeout(fallbackTimer);
+                fallbackTimer = null;
+            }
+            if (fallbackClient) {
+                try { fallbackClient.end(true); } catch (e) {}
+                fallbackClient = null;
+            }
+            if (peer) {
+                try { peer.destroy(); } catch (e) {}
+                peer = null;
+            }
+            dataConn = null;
+            mediaCall = null;
+        }
+
+        function startFallbackTelemetry(roomCode) {
+            if (fallbackClient || (dataConn && dataConn.open)) return;
+            if (typeof mqtt === 'undefined') {
+                console.warn("MQTT client library not loaded for fallback telemetry.");
+                return;
+            }
+
+            const topic = `bioscan/telemetry/${roomCode}`;
+            console.warn("DataChannel not open; starting fallback telemetry on:", topic);
+
+            fallbackClient = mqtt.connect(FALLBACK_BROKER_URL, {
+                clientId: `bioscan-laptop-${roomCode}-${Math.random().toString(16).slice(2, 6)}`,
+                clean: true,
+                reconnectPeriod: 2000
+            });
+
+            fallbackClient.on('connect', () => {
+                fallbackClient.subscribe(topic, { qos: 0 }, (err) => {
+                    if (err) console.error("Fallback subscribe error:", err);
+                });
+            });
+
+            fallbackClient.on('message', (_t, payload) => {
+                try {
+                    const parsed = JSON.parse(payload.toString());
+                    ingestIncomingPayload(parsed, "Relay");
+                } catch (e) {
+                    console.error("Invalid fallback telemetry payload:", e);
+                }
+            });
+
+            fallbackClient.on('error', (err) => {
+                console.error("Fallback telemetry error:", err);
+            });
+        }
+
+        function ingestIncomingPayload(data, transportLabel) {
+            if (!data) return;
+            const now = Date.now();
+            if (now - lastIngestedAt < 35) return; // Deduplicate near-simultaneous packets
+            lastIngestedAt = now;
+
+            hasTelemetryData = true;
+            updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
+
+            if (data.topClass) {
+                handleTelemetryData(data, transportLabel);
+            }
+        }
+
         function connectToiPhone() {
             const codeInput = document.getElementById("target-room-id").value.trim();
             if (!codeInput || codeInput.length !== 4 || isNaN(codeInput)) {
@@ -131,7 +201,7 @@
             hasTelemetryData = false;
             updateStatus("Connecting...", "bg-amber-500", "text-amber-400");
 
-            if (peer) peer.destroy();
+            cleanupConnections();
 
             peer = new Peer({
                 config: { iceServers: ICE_SERVERS }
@@ -143,19 +213,24 @@
 
                 dataConn.on('open', () => {
                     console.log("Command Center DataChannel opened to:", targetPeerId);
+                    if (fallbackTimer) {
+                        clearTimeout(fallbackTimer);
+                        fallbackTimer = null;
+                    }
+                    if (fallbackClient) {
+                        try { fallbackClient.end(true); } catch (e) {}
+                        fallbackClient = null;
+                    }
                     updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
                 });
 
                 dataConn.on('data', (data) => {
-                    hasTelemetryData = true;
-                    updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
-                    if (data && data.topClass) {
-                        handleTelemetryData(data);
-                    }
+                    ingestIncomingPayload(data, "WebRTC");
                 });
 
                 dataConn.on('error', (err) => {
                     console.error("DataChannel Error:", err);
+                    startFallbackTelemetry(codeInput);
                 });
 
                 dataConn.on('close', () => {
@@ -164,190 +239,6 @@
                         updateStatus("Disconnected", "bg-rose-500", "text-rose-400");
                     }
                 });
-            });
 
-            peer.on('open', (id) => {
-                console.log("Command Center Peer open:", id);
-
-                const openDataChannel = () => {
-                    if (dataConn && dataConn.open) return;
-                    if (dataConn) {
-                        try { dataConn.close(); } catch (e) {}
-                    }
-                    dataConn = peer.connect(targetPeerId, { reliable: true });
-
-                    dataConn.on('open', () => {
-                        console.log("Command Center DataChannel opened to:", targetPeerId);
-                        updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
-                    });
-
-                    dataConn.on('data', (data) => {
-                        hasTelemetryData = true;
-                        updateStatus("Connected & Streaming", "bg-emerald-500", "text-emerald-400");
-                        if (data && data.topClass) {
-                            handleTelemetryData(data);
-                        }
-                    });
-
-                    dataConn.on('error', (err) => {
-                        console.error("DataChannel Error:", err);
-                    });
-
-                    dataConn.on('close', () => {
-                        console.warn("DataChannel closed.");
-                        if (!hasVideoStream) {
-                            updateStatus("Disconnected", "bg-rose-500", "text-rose-400");
-                        }
-                    });
-                };
-
-                openDataChannel();
-
-                setTimeout(() => {
-                    if (!hasTelemetryData && (!dataConn || !dataConn.open) && peer && !peer.destroyed) {
-                        console.warn("DataChannel still not open on hotspot; retrying...");
-                        openDataChannel();
-                    }
-                }, 2500);
-            });
-
-            peer.on('error', (err) => {
-                console.error("WebRTC Error:", err);
-                if (!hasVideoStream && !hasTelemetryData) {
-                    updateStatus("Connection Failed", "bg-rose-500", "text-rose-400");
-                }
-            });
-        }
-
-        function handleTelemetryData(data) {
-            const { topClass, probability, allClasses } = data;
-            const pct = (probability * 100).toFixed(1);
-
-            document.getElementById("overlay-class").innerText = topClass;
-            document.getElementById("overlay-prob").innerText = `${pct}%`;
-
-            const container = document.getElementById("classes-list");
-            container.innerHTML = "";
-
-            if (allClasses && allClasses.length > 0) {
-                allClasses.sort((a, b) => b.prob - a.prob).forEach(item => {
-                    const classPct = (item.prob * 100).toFixed(1);
-                    const isTop = item.class === topClass;
-
-                    const row = document.createElement("div");
-                    row.className = "flex flex-col gap-1.5";
-                    row.innerHTML = `
-                        <div class="flex justify-between text-xs font-semibold">
-                            <span class="${isTop ? 'text-amber-400 font-bold' : 'text-slate-300'}">${item.class}</span>
-                            <span class="font-mono ${isTop ? 'text-amber-400 font-bold' : 'text-slate-400'}">${classPct}%</span>
-                        </div>
-                        <div class="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
-                            <div class="h-full ${isTop ? 'bg-amber-400' : 'bg-slate-700'} rounded-full transition-all duration-200" style="width: ${classPct}%"></div>
-                        </div>
-                    `;
-                    container.appendChild(row);
-                });
-            }
-
-            checkAndAutoCapture(topClass, probability);
-
-            document.getElementById("fps-counter").innerText = `Telemetry: ${Date.now() - lastMsgTimestamp}ms latency`;
-            lastMsgTimestamp = Date.now();
-        }
-
-        function checkAndAutoCapture(topClass, probability) {
-            const normalized = topClass.trim().toLowerCase();
-            const isBackground = IGNORED_CLASSES.includes(normalized) || probability < CONFIDENCE_THRESHOLD;
-
-            if (waitingForBackgroundReset) {
-                if (isBackground || topClass !== lastRecordedSample) {
-                    waitingForBackgroundReset = false;
-                } else {
-                    return;
-                }
-            }
-
-            if (!isBackground) {
-                if (candidateClass === topClass) {
-                    const elapsed = Date.now() - candidateStartTime;
-                    const progress = Math.min(100, Math.round((elapsed / HOLD_DURATION_MS) * 100));
-                    document.getElementById("capture-state-label").innerText = `Scanning Checkpoint (${progress}%)...`;
-
-                    if (elapsed >= HOLD_DURATION_MS) {
-                        recordSample(topClass, probability);
-                    }
-                } else {
-                    candidateClass = topClass;
-                    candidateStartTime = Date.now();
-                }
-            } else {
-                candidateClass = null;
-                candidateStartTime = null;
-                document.getElementById("capture-state-label").innerText = "Scanning checkpoints...";
-            }
-        }
-
-        function recordSample(sampleName, confidence) {
-            candidateClass = null;
-            candidateStartTime = null;
-            lastRecordedSample = sampleName;
-            waitingForBackgroundReset = true;
-
-            const confPct = (confidence * 100).toFixed(1);
-            const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
-            capturedSamplesHistory.push({
-                scanNum: capturedSamplesHistory.length + 1,
-                sample: sampleName,
-                confidence: confPct,
-                time: timestamp
-            });
-
-            renderReportHistory();
-            document.getElementById("capture-state-label").innerText = `Captured Scan #${capturedSamplesHistory.length} (${sampleName})! Moving...`;
-        }
-
-        function renderReportHistory() {
-            const breakdownElem = document.getElementById("report-breakdown");
-            if (capturedSamplesHistory.length === 0) {
-                breakdownElem.innerHTML = `<span class="text-slate-500 italic text-xs">Waiting for samples across checkpoints (&ge;80% confidence)...</span>`;
-                return;
-            }
-
-            let html = "";
-            capturedSamplesHistory.forEach(item => {
-                html += `
-                    <div class="bg-slate-900 p-3 rounded-lg border border-amber-500/30 flex justify-between items-center text-xs">
-                        <div class="flex flex-col gap-0.5">
-                            <span class="font-bold text-amber-400">Scan #${item.scanNum}: ${item.sample}</span>
-                            <span class="text-[10px] font-mono text-slate-400">${item.time}</span>
-                        </div>
-                        <span class="font-mono font-bold px-2.5 py-1 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
-                            ${item.confidence}%
-                        </span>
-                    </div>
-                `;
-            });
-            breakdownElem.innerHTML = html;
-        }
-
-        function resetReportForNextRun() {
-            capturedSamplesHistory = [];
-            candidateClass = null;
-            candidateStartTime = null;
-            lastRecordedSample = null;
-            waitingForBackgroundReset = false;
-
-            document.getElementById("capture-state-label").innerText = "Scanning checkpoints...";
-            renderReportHistory();
-        }
-
-        function updateStatus(text, bgClass, textClass) {
-            document.getElementById("connection-status").innerText = text;
-            document.getElementById("connection-status").className = `text-xs font-semibold ${textClass}`;
-            document.getElementById("status-dot").className = `relative inline-flex rounded-full h-3 w-3 ${bgClass}`;
-            document.getElementById("ping-dot").className = `animate-ping absolute inline-flex h-full w-full rounded-full ${bgClass} opacity-75`;
-        }
-    </script>
-</body>
-</html>
+                fallbackTimer = setTimeout(() => {
+                    if
